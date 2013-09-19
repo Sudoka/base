@@ -1,2 +1,2 @@
 NAME	=	rocks-sec-channel-client
-RELEASE	=	1
+RELEASE	=	2

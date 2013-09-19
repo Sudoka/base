@@ -1,2 +1,2 @@
 NAME = rocks-channel
-RELEASE = 0
+RELEASE = 1

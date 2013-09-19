@@ -133,6 +133,15 @@ int _rpcpmstart;
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include "channel.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <tcpd.h>
+
+/*
+ * This will be the service name used in hosts.allow and hosts.deny
+ */
+#define SERVICE_NAME "channeld"
 
 extern void channel_prog_1(struct svc_req *rqstp, register SVCXPRT *transp);
 
@@ -146,13 +155,71 @@ extern void channel_prog_1(struct svc_req *rqstp, register SVCXPRT *transp);
 # define RPC_SERVICE(a)   a
 #endif
 
+/*
+ * returns nonzero if tcpd/libwrap allows this connection
+ * returns 0 if tcpd/libwrap denies this connection
+ */
+int tcpd_allowed(struct svc_req *rqstp)
+{
+	static char remhost[1024];
+	int result;
+
+	assert(rqstp);
+	assert(rqstp->rq_xprt);
+
+	/* get the hostname from the IP */
+	result = getnameinfo( (struct sockaddr *) &(rqstp->rq_xprt->xp_raddr), 
+		rqstp->rq_xprt->xp_addrlen,
+		remhost,1024,
+		NULL, 0, 0);
+
+	/* stop here if getnameinfo blew up */
+	if(result && result != EAI_AGAIN && result != EAI_NONAME)
+	{
+		syslog(LOG_DEBUG,"getnameinfo(%s) failed: %s",
+			inet_ntoa(rqstp->rq_xprt->xp_raddr.sin_addr),
+			strerror(result));
+		return 0;
+	}
+
+	/* do the libwrap check */
+	result = hosts_ctl(SERVICE_NAME, remhost,
+		inet_ntoa(rqstp->rq_xprt->xp_raddr.sin_addr),
+		STRING_UNKNOWN);
+
+	if(result)
+	{
+		return result;
+	}
+	
+	/* report failures */
+	syslog(LOG_DEBUG,"hosts_ctl(\"%s\",%s,%s) rejected connection",
+		SERVICE_NAME, remhost,
+		inet_ntoa(rqstp->rq_xprt->xp_raddr.sin_addr));
+
+	return 0;
+
+}
+
 int *
 RPC_SERVICE(channel_ping_1)(struct svc_req *rqstp)
 {
-	static int  result = 1;
+	static int  result = 0;
 
 	assert(rqstp);
-	syslog(LOG_DEBUG, "ping received");
+
+	/* libwrap check - stop as soon as possible if we shouldn't talk to
+ 	   this host so the host can't pump in junk. Return 0 so
+	   RPC is otherwise happy */
+	if(!tcpd_allowed(rqstp))
+	{
+		return &result;
+	}
+
+	syslog(LOG_DEBUG, "ping received, socket %d clnt %s:%d", 
+		rqstp->rq_xprt->xp_sock,
+		inet_ntoa(rqstp->rq_xprt->xp_raddr.sin_addr),
+		ntohs(rqstp->rq_xprt->xp_raddr.sin_port));
 
 	return &result;
 } /* channel_ping_1_svc */
@@ -169,10 +236,20 @@ RPC_SERVICE(channel_411_alert_1)(char *filename, char *signature,
 	int		pid;
 	int		status;
 
+	assert(rqstp);
+
+	/* libwrap check - stop as soon as possible if we shouldn't talk to
+ 	   this host so the host can't pump in junk. Return 0 so RPC is
+           otherwise happy. */
+	if(!tcpd_allowed(rqstp))
+	{
+		result = 0;
+		return &result;
+	}
+
 	assert(filename);
 	assert(signature);
 	assert(time > 0);
-	assert(rqstp);
 
 	syslog(LOG_DEBUG, "411_alert received (file=\"%s\", time=%.6f)", filename, time);
 
@@ -213,7 +290,7 @@ main(int argc, char *argvp[])
 {
 	register SVCXPRT *transp;
 
-	openlog("channeld", LOG_PID, LOG_LOCAL0);
+	openlog(SERVICE_NAME, LOG_PID, LOG_LOCAL0);
 	syslog(LOG_INFO, "starting service");
 
 #if defined (__SVR4) && defined (__sun)
